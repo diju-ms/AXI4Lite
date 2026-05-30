@@ -1,12 +1,32 @@
 import os
 import sys
 import ast
-import time  # Added for OS file sync verification
+import time
 import argparse
 import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from cocotb_tools.runner import get_runner
+
+# ==============================================================================
+# USER CONFIGURATION SECTOR (Move/Adjust values here for rapid top control)
+# ==============================================================================
+# 1. Base directory anchors (Dynamically locked relative to this file's folder location)
+TB_PATH     = Path(__file__).resolve().parent
+PROJ_PATH   = TB_PATH.parent
+proj_path   = TB_PATH.parent
+
+# 2. Testbench and RTL Design Structural Identifiers
+TEST_MODULE_NAME  = "axi4_tb_top"   # Name of the Python testbench file (without .py)
+HDL_TOPLEVEL_NAME = "axi4_lite_top"  # Top-level Verilog/SystemVerilog module name
+
+# 3. Design Source RTL Files Array List
+SOURCES = [
+    PROJ_PATH / "design" / "axi4_lite_master.sv",
+    PROJ_PATH / "design" / "axi4_lite_slave.sv",
+    PROJ_PATH / "design" / "axi4_lite_top.sv",
+]
+# ==============================================================================
 
 def auto_discover_cocotb_tests(file_path, filter_string=None):
     """Programmatically extracts test names decorated with @cocotb.test() using AST."""
@@ -35,6 +55,7 @@ def auto_discover_cocotb_tests(file_path, filter_string=None):
     return test_names
 
 def main():
+    # --- PHASE 1: Command Line Interface Management ---
     parser = argparse.ArgumentParser(
         description="Automated Regression Runner and Test Wrapper for AXI4-Lite IP Verification.",
         formatter_class=argparse.RawTextHelpFormatter
@@ -43,6 +64,11 @@ def main():
     parser.add_argument("-f", "--format", choices=["fst", "vcd"], default="fst", help="Waveform trace format.")
     parser.add_argument("-s", "--sim", default="verilator", help="Target hardware simulator engine.")
     parser.add_argument("-t", "--test", default=None, help="Filter string to run specific tests.")
+    parser.add_argument(
+        "-o", "--outdir",
+        default=None,
+        help="Specify a custom target regression output directory containing both build/ and sim/ structures."
+    )
     
     args = parser.parse_args()
     
@@ -51,40 +77,39 @@ def main():
     wave_format = args.format
     test_filter = args.test
     
-    hdl_toplevel_name = "axi4_lite_top"
-    test_module_name = "axi4_tb_top"
+    # Locate targeted test file description matching the top configuration paths
+    test_file_path = TB_PATH / f"{TEST_MODULE_NAME}.py"
     
-    tb_path = Path(__file__).resolve().parent
-    proj_path = tb_path.parent
-    test_file_path = tb_path / f"{test_module_name}.py"
-    
-    sim_base_dir = tb_path / "sim"
-    sim_base_dir.mkdir(parents=True, exist_ok=True)
+    # Route output sandbox spaces matching input parameters
+    if args.outdir:
+        regression_root = Path(args.outdir).resolve()
+    else:
+        regression_root = TB_PATH
+        
+    base_build_dir = regression_root / "build"
+    sim_base_dir = regression_root / "sim"
     regression_log_path = sim_base_dir / "regression.log"
+    
+    base_build_dir.mkdir(parents=True, exist_ok=True)
+    sim_base_dir.mkdir(parents=True, exist_ok=True)
     
     all_tests = auto_discover_cocotb_tests(test_file_path, test_filter)
     if not all_tests:
-        print(f"[Error] No tests found matching criteria.")
+        print(f"[Error] No matching test behaviors discovered inside: {test_file_path}")
         sys.exit(1)
 
-    if str(tb_path) not in sys.path:
-        sys.path.insert(0, str(tb_path))
+    # Inject the actual testbench folder into Python's path registry
+    if str(TB_PATH) not in sys.path:
+        sys.path.insert(0, str(TB_PATH))
         
-    sources = [
-        proj_path / "design" / "axi4_lite_master.sv",
-        proj_path / "design" / "axi4_lite_slave.sv",
-        proj_path / "design" / "axi4_lite_top.sv",
-    ]
-    
-    base_build_dir = tb_path / "build"
     runner = get_runner(sim)
     
-    # --- PHASE 1: Clean Stale Residuals ---
-    for stale_file in [tb_path / "dump.fst", tb_path / "dump.vcd"]:
+    # Clean stale residual wave markers from the current working directory
+    for stale_file in [Path("dump.fst"), Path("dump.vcd")]:
         if stale_file.exists():
             stale_file.unlink()
 
-    # --- PHASE 2: Compile Design ---
+    # --- PHASE 2: Isolated Compilation Step ---
     build_args = []
     if sim == "verilator":
         build_args.extend(["--trace-fst" if wave_format == "fst" else "--trace", "--trace-structs"])
@@ -93,9 +118,13 @@ def main():
         
     try:
         runner.build(
-            sources=sources, hdl_toplevel=hdl_toplevel_name,
-            always=False, clean=False, build_args=build_args,
-            build_dir=base_build_dir, waves=True  
+            sources=SOURCES,
+            hdl_toplevel=HDL_TOPLEVEL_NAME,
+            always=False,
+            clean=False,
+            build_args=build_args,
+            build_dir=base_build_dir,
+            waves=True  
         )
     except Exception as e:
         print(f"\n[Fatal Error] Hardware compilation failed: {e}")
@@ -112,7 +141,8 @@ def main():
     log_print(f" SIMULATOR      : {sim}")
     log_print(f" WAVE DUMPING   : {enable_waves} (Format: {wave_format})")
     log_print(f" TARGET FILTER  : {test_filter if test_filter else 'NONE (RUNNING EVERY TESTCASE)'}")
-    log_print(f" REGRESSION LOG : {regression_log_path.relative_to(proj_path)}")
+    log_print(f" OUTPUT DIR     : {regression_root}")
+    log_print(f" REGRESSION LOG : {regression_log_path}")
     log_print("="*80 + "\n")
 
     test_records = []
@@ -128,41 +158,47 @@ def main():
         elif sim == "icarus":
             sim_args.append(f"-l{test_isolated_dir}/{test_name}_sim.log")
             
-        test_env = {"COCOTB_TEST_FILTER": f"{test_module_name}.{test_name}$"}
+        test_env = {"COCOTB_TEST_FILTER": f"{TEST_MODULE_NAME}.{test_name}$"}
         
         log_print(f"--> Running Test Case: [{test_name}]")
-        log_print(f"    Sandbox Workspace: {test_isolated_dir.relative_to(proj_path)}")
+        log_print(f"    Sandbox Workspace: {test_isolated_dir}")
         
         target_log_path = test_isolated_dir / "run.log"
         xml_report_path = test_isolated_dir / f"results_{test_name}.xml"
         
         runner.test(
-            hdl_toplevel=hdl_toplevel_name, test_module=test_module_name,       
-            build_dir=base_build_dir, test_dir=tb_path, test_args=sim_args,                 
-            waves=enable_waves, extra_env=test_env, log_file=target_log_path, results_xml=xml_report_path
+            hdl_toplevel=HDL_TOPLEVEL_NAME,
+            test_module=TEST_MODULE_NAME,       
+            build_dir=base_build_dir,           
+            test_dir=TB_PATH,                    
+            test_args=sim_args,                 
+            waves=enable_waves,                 
+            extra_env=test_env,                 
+            log_file=target_log_path,           
+            results_xml=xml_report_path
         )
 
-        # --- OPTIMIZATION: Wait for OS File Flush Synchronization ---
+        # Sync verification pause to handle OS text flushes safely
         retry_loops = 5
         while retry_loops > 0 and (not target_log_path.exists() or target_log_path.stat().st_size == 0):
-            time.sleep(0.05)  # Let filesystem buffering catch up and write data cleanly
+            time.sleep(0.05)
             retry_loops -= 1
 
         # --- PHASE 4: Waveform Relocation ---
         if enable_waves:
-            cocotb_default_fst = tb_path / "dump.fst"
-            cocotb_default_vcd = tb_path / "dump.vcd"
+            cocotb_default_fst = Path("dump.fst")
+            cocotb_default_vcd = Path("dump.vcd")
             final_wave_ext = "fst" if wave_format == "fst" else "vcd"
             isolated_wave_dest = test_isolated_dir / f"{test_name}.{final_wave_ext}"
             
             if cocotb_default_fst.exists():
                 shutil.move(str(cocotb_default_fst), str(isolated_wave_dest))
-                log_print(f"    Waveform Captured: {isolated_wave_dest.relative_to(proj_path)}")
+                log_print(f"    Waveform Captured: {isolated_wave_dest}")
             elif cocotb_default_vcd.exists():
                 shutil.move(str(cocotb_default_vcd), str(isolated_wave_dest))
-                log_print(f"    Waveform Captured: {isolated_wave_dest.relative_to(proj_path)}")
+                log_print(f"    Waveform Captured: {isolated_wave_dest}")
 
-        # --- PHASE 5: Statistics Extraction ---
+        # --- PHASE 5: Statistics Sheet Extraction ---
         status, sim_time, real_time = "PASSED", "0.0", "0.0"
         if xml_report_path.exists():
             try:
@@ -183,20 +219,21 @@ def main():
         test_records.append({"name": test_name, "status": status, "real_time": real_time, "sim_time": sim_time})
         log_print(f"    Status Result    : {status}\n")
 
-    # --- PHASE 6: Summary Generation ---
+    # --- PHASE 6: Summary Generation Block (FIXED: Swapped print out for log_print) ---
     total_run = len(test_records)
     passed_count = sum(1 for t in test_records if t["status"] == "PASSED")
     failed_count = sum(1 for t in test_records if t["status"] == "FAILED")
     other_count = total_run - (passed_count + failed_count)
 
-    log_print("="*80)
+    log_print("\n" + "="*80)
     log_print("                       AXI4LITE REGRESSION SUMMARY REPORT")
     log_print("="*80)
     log_print(f" {'TEST CASE NAME':<35} | {'STATUS':<10} | {'SIM TIME (ns)':<13} | {'REAL TIME (s)':<10}")
     log_print(" " + "-"*78)
     for record in test_records:
         log_print(f" {record['name']:<35} | {record['status']:<10} | {record['sim_time']:<13} | {record['real_time']:<10}")
-    log_print(" " + "-"*78)
+
+    log_print(f" " + "-"*78)
     log_print(f" TOTAL TESTS RUN : {total_run}")
     log_print(f" PASSED          : {passed_count}")
     log_print(f" FAILED          : {failed_count}")
